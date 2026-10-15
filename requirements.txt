@@ -1,3 +1,8 @@
 Flask>=3.0,<4.0
 Werkzeug>=3.0,<4.0
+<<<<<<< HEAD
+=======
+psycopg2-binary>=2.9,<3.0
+>>>>>>> dcb334216c142c85a7efc303782eb00af8a45470
+gunicorn
 gunicorn

@@ -1,4 +1,6 @@
 import os, re, sqlite3
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from functools import wraps
 from urllib.parse import urlparse
 from flask import Flask, render_template, request, redirect, url_for, session, flash, g, abort
@@ -7,39 +9,269 @@ from werkzeug.security import generate_password_hash, check_password_hash
 ROOT = os.path.abspath(os.path.dirname(__file__))
 DB_PATH = os.path.join(ROOT, "data", "peernest.db")
 app = Flask(__name__)
-app.config.update(SECRET_KEY=os.environ.get("PEERNEST_SECRET_KEY", "dev-only-change-this-secret"), SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
+secret_key = os.environ.get("PEERNEST_SECRET_KEY")
+if os.environ.get("VERCEL") and not secret_key:
+    raise RuntimeError("Set PEERNEST_SECRET_KEY in Vercel Environment Variables before deploying.")
+app.config.update(
+    SECRET_KEY=secret_key or "dev-only-change-this-secret",
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SAMESITE="Lax",
+    SESSION_COOKIE_SECURE=bool(os.environ.get("VERCEL")),
+)
+
+class PgDatabase:
+    """Small adapter preserving the execute/fetch API used by this Flask app."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    @staticmethod
+    def _sql(statement):
+        # The app's parameterized SQL uses SQLite-style ? placeholders.
+        # psycopg2 uses %s placeholders.
+        return statement.replace("?", "%s")
+
+    def execute(self, statement, params=()):
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.execute(self._sql(statement), params)
+        return cursor
+
+    def executemany(self, statement, params):
+        cursor = self.connection.cursor(cursor_factory=RealDictCursor)
+        cursor.executemany(self._sql(statement), params)
+        return cursor
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
+
+class SQLiteDatabase:
+    """SQLite adapter used for local development when DATABASE_URL is not set."""
+    def __init__(self, connection):
+        self.connection = connection
+
+    def execute(self, statement, params=()):
+        return self.connection.execute(statement, params)
+
+    def executemany(self, statement, params):
+        return self.connection.executemany(statement, params)
+
+    def commit(self):
+        self.connection.commit()
+
+    def rollback(self):
+        self.connection.rollback()
+
+    def close(self):
+        self.connection.close()
+
 
 def db():
     if "db" not in g:
-        os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
-        g.db = sqlite3.connect(DB_PATH)
-        g.db.row_factory = sqlite3.Row
-        g.db.execute("PRAGMA foreign_keys=ON")
+        database_url = os.environ.get("DATABASE_URL")
+        if database_url:
+            g.db = PgDatabase(psycopg2.connect(database_url))
+        else:
+            os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+            connection = sqlite3.connect(DB_PATH)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA foreign_keys=ON")
+            g.db = SQLiteDatabase(connection)
     return g.db
+
 
 @app.teardown_appcontext
 def close_db(exc=None):
     conn = g.pop("db", None)
-    if conn: conn.close()
+    if conn:
+        conn.close()
+
+
+POSTGRES_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id BIGSERIAL PRIMARY KEY,
+    email TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text)
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (LOWER(email));
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_uq ON users (LOWER(username));
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id BIGINT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    full_name TEXT DEFAULT '', college TEXT DEFAULT '', qualification TEXT DEFAULT '',
+    branch TEXT DEFAULT '', study_status TEXT DEFAULT 'Student', study_year TEXT DEFAULT '',
+    graduation_year TEXT DEFAULT '', bio TEXT DEFAULT '', github_url TEXT DEFAULT '',
+    linkedin_url TEXT DEFAULT '', portfolio_url TEXT DEFAULT '', availability TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS skills (
+    id BIGSERIAL PRIMARY KEY, name TEXT NOT NULL, category TEXT DEFAULT 'Other'
+);
+CREATE UNIQUE INDEX IF NOT EXISTS skills_name_lower_uq ON skills (LOWER(name));
+CREATE TABLE IF NOT EXISTS user_skills (
+    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    skill_id BIGINT REFERENCES skills(id) ON DELETE CASCADE,
+    skill_type TEXT CHECK(skill_type IN ('teach','learn')),
+    level TEXT DEFAULT 'Beginner',
+    PRIMARY KEY(user_id,skill_id,skill_type)
+);
+CREATE TABLE IF NOT EXISTS contact_requests (
+    id BIGSERIAL PRIMARY KEY,
+    sender_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    message TEXT NOT NULL, status TEXT DEFAULT 'pending',
+    created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text),
+    UNIQUE(sender_id,recipient_id)
+);
+CREATE TABLE IF NOT EXISTS connections (
+    id BIGSERIAL PRIMARY KEY,
+    user_a BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    user_b BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text),
+    UNIQUE(user_a,user_b), CHECK(user_a < user_b)
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id BIGSERIAL PRIMARY KEY,
+    connection_id BIGINT REFERENCES connections(id) ON DELETE CASCADE,
+    sender_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    body TEXT NOT NULL, created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text)
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id BIGSERIAL PRIMARY KEY,
+    requester_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    partner_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    skill TEXT NOT NULL, model TEXT CHECK(model IN ('exchange','mentoring')),
+    topic TEXT DEFAULT '', proposed_at TEXT DEFAULT '', duration INTEGER DEFAULT 60,
+    status TEXT DEFAULT 'pending', created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text),
+    completed_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id BIGSERIAL PRIMARY KEY,
+    session_id BIGINT REFERENCES sessions(id) ON DELETE CASCADE,
+    reviewer_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    reviewee_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    rating INTEGER CHECK(rating BETWEEN 1 AND 5), body TEXT DEFAULT '',
+    created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text), UNIQUE(session_id,reviewer_id)
+);
+CREATE TABLE IF NOT EXISTS session_feedback (
+    id BIGSERIAL PRIMARY KEY,
+    session_id BIGINT REFERENCES sessions(id) ON DELETE CASCADE,
+    author_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    body TEXT NOT NULL, created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text)
+);
+CREATE TABLE IF NOT EXISTS xp_events (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    session_id BIGINT REFERENCES sessions(id) ON DELETE CASCADE,
+    event_key TEXT NOT NULL, points INTEGER NOT NULL,
+    created_at TEXT DEFAULT (CURRENT_TIMESTAMP::text),
+    UNIQUE(user_id,session_id,event_key)
+);
+CREATE TABLE IF NOT EXISTS user_badges (
+    id BIGSERIAL PRIMARY KEY,
+    user_id BIGINT REFERENCES users(id) ON DELETE CASCADE,
+    badge_key TEXT NOT NULL, earned_at TEXT DEFAULT (CURRENT_TIMESTAMP::text),
+    UNIQUE(user_id,badge_key)
+);
+"""
+
+
+SQLITE_SCHEMA = """
+CREATE TABLE IF NOT EXISTS users (
+    id INTEGER PRIMARY KEY,
+    email TEXT NOT NULL,
+    username TEXT NOT NULL,
+    password_hash TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE UNIQUE INDEX IF NOT EXISTS users_email_lower_uq ON users (LOWER(email));
+CREATE UNIQUE INDEX IF NOT EXISTS users_username_lower_uq ON users (LOWER(username));
+CREATE TABLE IF NOT EXISTS profiles (
+    user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+    full_name TEXT DEFAULT '', college TEXT DEFAULT '', qualification TEXT DEFAULT '',
+    branch TEXT DEFAULT '', study_status TEXT DEFAULT 'Student', study_year TEXT DEFAULT '',
+    graduation_year TEXT DEFAULT '', bio TEXT DEFAULT '', github_url TEXT DEFAULT '',
+    linkedin_url TEXT DEFAULT '', portfolio_url TEXT DEFAULT '', availability TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS skills (id INTEGER PRIMARY KEY, name TEXT NOT NULL, category TEXT DEFAULT 'Other');
+CREATE UNIQUE INDEX IF NOT EXISTS skills_name_lower_uq ON skills (LOWER(name));
+CREATE TABLE IF NOT EXISTS user_skills (
+    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    skill_id INTEGER REFERENCES skills(id) ON DELETE CASCADE,
+    skill_type TEXT CHECK(skill_type IN ('teach','learn')),
+    level TEXT DEFAULT 'Beginner', PRIMARY KEY(user_id,skill_id,skill_type)
+);
+CREATE TABLE IF NOT EXISTS contact_requests (
+    id INTEGER PRIMARY KEY, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE, message TEXT NOT NULL,
+    status TEXT DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(sender_id,recipient_id)
+);
+CREATE TABLE IF NOT EXISTS connections (
+    id INTEGER PRIMARY KEY, user_a INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    user_b INTEGER REFERENCES users(id) ON DELETE CASCADE, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_a,user_b), CHECK(user_a < user_b)
+);
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY, connection_id INTEGER REFERENCES connections(id) ON DELETE CASCADE,
+    sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS sessions (
+    id INTEGER PRIMARY KEY, requester_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    partner_id INTEGER REFERENCES users(id) ON DELETE CASCADE, skill TEXT NOT NULL,
+    model TEXT CHECK(model IN ('exchange','mentoring')), topic TEXT DEFAULT '',
+    proposed_at TEXT DEFAULT '', duration INTEGER DEFAULT 60, status TEXT DEFAULT 'pending',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT DEFAULT ''
+);
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    reviewee_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    rating INTEGER CHECK(rating BETWEEN 1 AND 5), body TEXT DEFAULT '',
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(session_id,reviewer_id)
+);
+CREATE TABLE IF NOT EXISTS session_feedback (
+    id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    author_id INTEGER REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL,
+    created_at TEXT DEFAULT CURRENT_TIMESTAMP
+);
+CREATE TABLE IF NOT EXISTS xp_events (
+    id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE,
+    event_key TEXT NOT NULL, points INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(user_id,session_id,event_key)
+);
+CREATE TABLE IF NOT EXISTS user_badges (
+    id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
+    badge_key TEXT NOT NULL, earned_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,badge_key)
+);
+"""
+
 
 def init_db():
-    db().executescript("""
-    CREATE TABLE IF NOT EXISTS users(id INTEGER PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, username TEXT NOT NULL UNIQUE COLLATE NOCASE, password_hash TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS profiles(user_id INTEGER PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE, full_name TEXT DEFAULT '', college TEXT DEFAULT '', qualification TEXT DEFAULT '', branch TEXT DEFAULT '', study_status TEXT DEFAULT 'Student', study_year TEXT DEFAULT '', graduation_year TEXT DEFAULT '', bio TEXT DEFAULT '', github_url TEXT DEFAULT '', linkedin_url TEXT DEFAULT '', portfolio_url TEXT DEFAULT '', availability TEXT DEFAULT '');
-    CREATE TABLE IF NOT EXISTS skills(id INTEGER PRIMARY KEY, name TEXT NOT NULL UNIQUE COLLATE NOCASE, category TEXT DEFAULT 'Other');
-    CREATE TABLE IF NOT EXISTS user_skills(user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, skill_id INTEGER REFERENCES skills(id) ON DELETE CASCADE, skill_type TEXT CHECK(skill_type IN ('teach','learn')), level TEXT DEFAULT 'Beginner', PRIMARY KEY(user_id,skill_id,skill_type));
-    CREATE TABLE IF NOT EXISTS contact_requests(id INTEGER PRIMARY KEY, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, recipient_id INTEGER REFERENCES users(id) ON DELETE CASCADE, message TEXT NOT NULL, status TEXT DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(sender_id,recipient_id));
-    CREATE TABLE IF NOT EXISTS connections(id INTEGER PRIMARY KEY, user_a INTEGER REFERENCES users(id) ON DELETE CASCADE, user_b INTEGER REFERENCES users(id) ON DELETE CASCADE, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_a,user_b), CHECK(user_a < user_b));
-    CREATE TABLE IF NOT EXISTS messages(id INTEGER PRIMARY KEY, connection_id INTEGER REFERENCES connections(id) ON DELETE CASCADE, sender_id INTEGER REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS sessions(id INTEGER PRIMARY KEY, requester_id INTEGER REFERENCES users(id) ON DELETE CASCADE, partner_id INTEGER REFERENCES users(id) ON DELETE CASCADE, skill TEXT NOT NULL, model TEXT CHECK(model IN ('exchange','mentoring')), topic TEXT DEFAULT '', proposed_at TEXT DEFAULT '', duration INTEGER DEFAULT 60, status TEXT DEFAULT 'pending', created_at TEXT DEFAULT CURRENT_TIMESTAMP, completed_at TEXT DEFAULT '');
-    CREATE TABLE IF NOT EXISTS reviews(id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE, reviewer_id INTEGER REFERENCES users(id) ON DELETE CASCADE, reviewee_id INTEGER REFERENCES users(id) ON DELETE CASCADE, rating INTEGER CHECK(rating BETWEEN 1 AND 5), body TEXT DEFAULT '', created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(session_id,reviewer_id));
-    CREATE TABLE IF NOT EXISTS session_feedback(id INTEGER PRIMARY KEY, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE, author_id INTEGER REFERENCES users(id) ON DELETE CASCADE, body TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP);
-    CREATE TABLE IF NOT EXISTS xp_events(id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, session_id INTEGER REFERENCES sessions(id) ON DELETE CASCADE, event_key TEXT NOT NULL, points INTEGER NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,session_id,event_key));
-    CREATE TABLE IF NOT EXISTS user_badges(id INTEGER PRIMARY KEY, user_id INTEGER REFERENCES users(id) ON DELETE CASCADE, badge_key TEXT NOT NULL, earned_at TEXT DEFAULT CURRENT_TIMESTAMP, UNIQUE(user_id,badge_key));
-    """)
-    db().executemany("INSERT OR IGNORE INTO skills(name,category) VALUES(?,?)", [
-      ("Python","Programming"),("C","Programming"),("C++","Programming"),("Java","Programming"),("JavaScript","Programming"),("HTML & CSS","Web Development"),("Flask","Web Development"),("SQL","Database"),("UI/UX Design","Design"),("Figma","Design"),("Graphic Design","Design"),("Video Editing","Creative"),("Public Speaking","Communication"),("Excel","Productivity"),("DSA","Programming"),("Photography","Creative"),("Machine Learning","AI & Data"),("Git & GitHub","Tools")])
-    db().commit()
+    d = db()
+    schema = POSTGRES_SCHEMA if os.environ.get("DATABASE_URL") else SQLITE_SCHEMA
+    for statement in schema.split(";"):
+        if statement.strip():
+            d.execute(statement)
+    d.executemany(
+        "INSERT INTO skills(name,category) VALUES(?,?) ON CONFLICT DO NOTHING",
+        [
+            ("Python","Programming"),("C","Programming"),("C++","Programming"),
+            ("Java","Programming"),("JavaScript","Programming"),("HTML & CSS","Web Development"),
+            ("Flask","Web Development"),("SQL","Database"),("UI/UX Design","Design"),
+            ("Figma","Design"),("Graphic Design","Design"),("Video Editing","Creative"),
+            ("Public Speaking","Communication"),("Excel","Productivity"),("DSA","Programming"),
+            ("Photography","Creative"),("Machine Learning","AI & Data"),("Git & GitHub","Tools")
+        ]
+    )
+    d.commit()
 
 @app.before_request
 def load_user():
@@ -76,7 +308,7 @@ def connection(uid, other):
 
 def create_connection(uid, other):
     a,b=sorted((uid,other))
-    db().execute("INSERT OR IGNORE INTO connections(user_a,user_b) VALUES(?,?)",(a,b))
+    db().execute("INSERT INTO connections(user_a,user_b) VALUES(?,?) ON CONFLICT DO NOTHING",(a,b))
 
 def valid_url(value, domain=None):
     try:
@@ -104,7 +336,7 @@ def badges(uid):
     d=db()
     counts={k:d.execute("SELECT COUNT(*) n FROM xp_events WHERE user_id=? AND event_key=?",(uid,k)).fetchone()["n"] for k in ("teach","learn","exchange")}
     for key, ok in [("first_lesson",counts["teach"]+counts["learn"]>=1),("knowledge_sharer",counts["teach"]>=5),("curious_mind",counts["learn"]>=5),("exchange_pro",counts["exchange"]>=5)]:
-        if ok: d.execute("INSERT OR IGNORE INTO user_badges(user_id,badge_key) VALUES(?,?)",(uid,key))
+        if ok: d.execute("INSERT INTO user_badges(user_id,badge_key) VALUES(?,?) ON CONFLICT DO NOTHING",(uid,key))
     d.commit()
     return d.execute("SELECT badge_key,earned_at FROM user_badges WHERE user_id=? ORDER BY earned_at DESC",(uid,)).fetchall()
 
@@ -145,11 +377,12 @@ def signup():
         if error: flash(error,"error")
         else:
             try:
-                cur=db().execute("INSERT INTO users(email,username,password_hash) VALUES(?,?,?)",(email,username,generate_password_hash(password)))
-                db().execute("INSERT INTO profiles(user_id,full_name) VALUES(?,?)",(cur.lastrowid,username)); db().commit()
-                session.clear(); session["uid"]=cur.lastrowid
+                cur=db().execute("INSERT INTO users(email,username,password_hash) VALUES(?,?,?) RETURNING id",(email,username,generate_password_hash(password)))
+                new_uid=cur.fetchone()["id"]
+                db().execute("INSERT INTO profiles(user_id,full_name) VALUES(?,?)",(new_uid,username)); db().commit()
+                session.clear(); session["uid"]=new_uid
                 flash("Welcome to PeerNest. Let's build your profile.","success"); return redirect(url_for("edit_profile"))
-            except sqlite3.IntegrityError:
+            except (sqlite3.IntegrityError, psycopg2.IntegrityError):
                 db().rollback(); flash("That email or username is already registered.","error")
     return render_template("auth.html",mode="signup")
 
@@ -203,8 +436,8 @@ def manage_skills():
             name=request.form.get("skill_name","").strip()[:60]; kind=request.form.get("skill_type","teach"); level_name=request.form.get("level","Beginner"); category=request.form.get("category","Other")[:60]
             if not name or kind not in ("teach","learn") or level_name not in ("Beginner","Intermediate","Advanced"): flash("Enter a valid skill and options.","error")
             else:
-                db().execute("INSERT OR IGNORE INTO skills(name,category) VALUES(?,?)",(name,category)); s=db().execute("SELECT id FROM skills WHERE name=? COLLATE NOCASE",(name,)).fetchone()
-                db().execute("INSERT OR REPLACE INTO user_skills(user_id,skill_id,skill_type,level) VALUES(?,?,?,?)",(g.user["id"],s["id"],kind,level_name)); db().commit(); flash("Skill added.","success")
+                db().execute("INSERT INTO skills(name,category) VALUES(?,?) ON CONFLICT DO NOTHING",(name,category)); s=db().execute("SELECT id FROM skills WHERE LOWER(name)=LOWER(?)",(name,)).fetchone()
+                db().execute("INSERT INTO user_skills(user_id,skill_id,skill_type,level) VALUES(?,?,?,?) ON CONFLICT(user_id,skill_id,skill_type) DO UPDATE SET level=EXCLUDED.level",(g.user["id"],s["id"],kind,level_name)); db().commit(); flash("Skill added.","success")
         return redirect(url_for("manage_skills"))
     return render_template("skills.html",teach=skills(g.user["id"],"teach"),learn=skills(g.user["id"],"learn"))
 
@@ -327,7 +560,7 @@ def sessions_page():
         elif action=="complete" and s["status"] in ("accepted","ongoing"):
             d.execute("UPDATE sessions SET status='completed',completed_at=CURRENT_TIMESTAMP WHERE id=?",(sid,))
             events=([(s["requester_id"],"teach",50),(s["requester_id"],"learn",40),(s["partner_id"],"teach",50),(s["partner_id"],"learn",40),(s["requester_id"],"exchange",60),(s["partner_id"],"exchange",60)] if s["model"]=="exchange" else [(s["requester_id"],"learn",40),(s["partner_id"],"teach",50)])
-            for person_id,key,points in events: d.execute("INSERT OR IGNORE INTO xp_events(user_id,session_id,event_key,points) VALUES(?,?,?,?)",(person_id,sid,key,points))
+            for person_id,key,points in events: d.execute("INSERT INTO xp_events(user_id,session_id,event_key,points) VALUES(?,?,?,?) ON CONFLICT DO NOTHING",(person_id,sid,key,points))
             d.commit(); badges(s["requester_id"]); badges(s["partner_id"]); flash("Session completed. XP awarded!","success")
         elif action=="cancel" and s["status"] in ("pending","accepted") and uid in (s["requester_id"],s["partner_id"]): d.execute("UPDATE sessions SET status='cancelled' WHERE id=?",(sid,)); d.commit(); flash("Session cancelled.","info")
         return redirect(url_for("sessions_page"))

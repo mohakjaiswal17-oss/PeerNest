@@ -13,27 +13,27 @@ DEMO_PASSWORD = "Demo12345!"
 
 def get_or_create_user(email, username, full_name, bio, teaches, learns):
     conn = db()
-    row = conn.execute("SELECT id FROM users WHERE username=? COLLATE NOCASE", (username,)).fetchone()
+    row = conn.execute("SELECT id FROM users WHERE LOWER(username)=LOWER(?)", (username,)).fetchone()
     if row:
         uid = row["id"]
     else:
         cur = conn.execute(
-            "INSERT INTO users(email, username, password_hash) VALUES(?,?,?)",
+            "INSERT INTO users(email, username, password_hash) VALUES(?,?,?) RETURNING id",
             (email, username, generate_password_hash(DEMO_PASSWORD)),
         )
-        uid = cur.lastrowid
+        uid = cur.fetchone()["id"]
 
-    conn.execute("""INSERT OR IGNORE INTO profiles
+    conn.execute("""INSERT INTO profiles
         (user_id,full_name,college,qualification,branch,study_status,study_year,graduation_year,bio,availability)
-        VALUES(?,?,?,?,?,?,?,?,?,?)""",
+        VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING""",
         (uid, full_name, "Arya College of Engineering", "B.Tech", "Computer Science", "Student", "2nd Year", "2029", bio, "Weekends and evenings"))
     conn.execute("""UPDATE profiles SET full_name=?,college=?,qualification=?,branch=?,study_status=?,study_year=?,graduation_year=?,bio=?,availability=? WHERE user_id=?""",
         (full_name, "Arya College of Engineering", "B.Tech", "Computer Science", "Student", "2nd Year", "2029", bio, "Weekends and evenings", uid))
 
     for name, category, kind, level in teaches + learns:
-        conn.execute("INSERT OR IGNORE INTO skills(name,category) VALUES(?,?)", (name, category))
-        skill = conn.execute("SELECT id FROM skills WHERE name=? COLLATE NOCASE", (name,)).fetchone()
-        conn.execute("INSERT OR IGNORE INTO user_skills(user_id,skill_id,skill_type,level) VALUES(?,?,?,?)", (uid, skill["id"], kind, level))
+        conn.execute("INSERT INTO skills(name,category) VALUES(?,?) ON CONFLICT DO NOTHING", (name, category))
+        skill = conn.execute("SELECT id FROM skills WHERE LOWER(name)=LOWER(?)", (name,)).fetchone()
+        conn.execute("INSERT INTO user_skills(user_id,skill_id,skill_type,level) VALUES(?,?,?,?) ON CONFLICT DO NOTHING", (uid, skill["id"], kind, level))
     conn.commit()
     return uid
 
